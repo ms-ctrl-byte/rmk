@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Hosted Availability Calendar</title>
+
+<!-- ICAL parser -->
+<script src="https://cdn.jsdelivr.net/npm/ical.js@1.4.0/build/ical.min.js"></script>
+
+<!-- FullCalendar (global) -->
+<link href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.8/index.global.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.8/index.global.min.js"></script>
+
+<style>
+  body { font-family: Arial, sans-serif; margin: 14px; color:#222; }
+  #wrap { max-width: 920px; margin: 0 auto; }
+  h1 { font-size:18px; margin: 6px 0 12px; text-align:center; }
+  #calendar { max-width: 900px; margin: 0 auto; }
+  /* compact day cells for laptop screens */
+  .fc-daygrid-day-frame { height: 64px !important; }
+  .controls { text-align:center; margin-top:12px; }
+  .external-button {
+    display:inline-block; padding:10px 16px; margin:6px;
+    background:#0078D4; color:#fff; text-decoration:none; border-radius:6px;
+    font-size:14px; opacity:0.5; pointer-events:none;
+  }
+  .external-button.enabled { opacity:1; pointer-events:auto; }
+  .legend { max-width:900px; margin:10px auto; font-size:13px; color:#444; text-align:center; }
+  .note { font-size:12px; color:#666; text-align:center; margin-top:6px; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <h1>Availability Calendar</h1>
+    <div id="calendar"></div>
+
+    <div class="controls">
+      <a id="vrboButton" class="external-button" href="#" target="_blank">Book on VRBO</a>
+      <a id="airbnbButton" class="external-button" href="#" target="_blank">Book on Airbnb</a>
+    </div>
+
+    <div class="legend">
+      <span style="display:inline-block;margin-right:12px;">■ Full day booked</span>
+      <span style="display:inline-block;background:linear-gradient(135deg,#d3d3d3 50%,transparent 50%);padding:4px 8px;border-radius:3px;margin-left:8px;">Diagonal = partial day</span>
+    </div>
+    <div class="note">Click a start date, then click an end date to populate booking links.</div>
+  </div>
+
+<script>
+(function(){
+  // CONFIG
+  const ICS_URL = "https://www.lodgify.com/5937f473-b452-48af-9c22-00ab310a253a.ics";
+  const PROXY_URLS = [
+    "https://cors.isomorphic-git.org/" + ICS_URL,
+    "https://api.allorigins.win/raw?url=" + encodeURIComponent(ICS_URL),
+    "https://cors.bridged.cc/" + ICS_URL
+  ];
+
+  const vrboBase = "https://www.vrbo.com/4833299";
+  const airbnbBase = "https://www.airbnb.com/rooms/1579217473503589577";
+
+  // UI refs
+  const vrboButton = document.getElementById('vrboButton');
+  const airbnbButton = document.getElementById('airbnbButton');
+
+  // helper: try fetch list until success
+  async function fetchWithFallback(urls) {
+    for (let u of urls) {
+      try {
+        const res = await fetch(u, {cache:'no-store'});
+        if (!res.ok) throw new Error('Status ' + res.status);
+        const txt = await res.text();
+        if (txt && txt.length > 50) return txt;
+      } catch (e) {
+        // continue to next
+        console.warn('Fetch failed for', u, e && e.toString());
+      }
+    }
+    throw new Error('All fetch attempts failed');
+  }
+
+  // parse ICS text to event objects using ICAL.js
+  function parseIcsToEvents(icsText) {
+    try {
+      const jcal = ICAL.parse(icsText);
+      const comp = new ICAL.Component(jcal);
+      const vevents = comp.getAllSubcomponents('vevent') || [];
+      const events = vevents.map(v => {
+        const ve = new ICAL.Event(v);
+        // ICAL.Event's startDate and endDate are ICAL.Time objects
+        const start = ve.startDate.toJSDate();
+        const end = ve.endDate ? ve.endDate.toJSDate() : new Date(start.getTime() + 24*60*60*1000);
+        // Normalize all-day detection: if time is 00:00 and original value had no time, treat as all-day
+        const isAllDay = ve.startDate.isDate;
+        return {
+          title: ve.summary || 'Booked',
+          start: start,
+          end: end,
+          allDay: isAllDay
+        };
+      });
+      return events;
+    } catch (e) {
+      console.error('ICS parse error', e);
+      return [];
+    }
+  }
+
+  // Build calendar
+  const calendarEl = document.getElementById('calendar');
+  let firstDate = null;
+
+  const calendar = new FullCalendar.Calendar(calendarEl, {
+    initialView: 'dayGridMonth',
+    height: 560,
+    selectable: true,
+    dayMaxEventRows: 3,
+    // click start -> click end selection
+    dateClick: function(info) {
+      if (!firstDate) {
+        firstDate = info.dateStr;
+        // visual cue: briefly highlight start
+        const el = info.dayEl;
+        if (el) {
+          el.style.outline = '2px solid #0078D4';
+          setTimeout(()=>{ el.style.outline = ''; }, 900);
+        }
+      } else {
+        const start = firstDate;
+        const end = info.dateStr;
+        firstDate = null;
+        vrboButton.href = `${vrboBase}?startDate=${start}&endDate=${end}&chkin=${start}&chkout=${end}&searchId=4874753d-0dfc-452c-92f1-216832008209`;
+        vrboButton.classList.add('enabled');
+        airbnbButton.href = `${airbnbBase}?check_in=${start}&check_out=${end}`;
+        airbnbButton.classList.add('enabled');
+      }
+    },
+
+    // robust per-cell shading: compute overlap between event and the cell date
+    eventDidMount: function(info) {
+      try {
+        const evStart = info.event.start;
+        const evEnd = info.event.end || new Date(evStart.getTime() + 24*60*60*1000);
+
+        // find the day cell this instance is rendered in
+        const dayCell = info.el.closest('.fc-daygrid-day');
+        if (!dayCell) return;
+
+        const cellDateStr = dayCell.getAttribute('data-date');
+        if (!cellDateStr) return;
+
+        const dayStart = new Date(cellDateStr + 'T00:00:00');
+        const dayEnd = new Date(dayStart.getTime() + 24*60*60*1000);
+
+        const overlapStart = evStart > dayStart ? evStart : dayStart;
+        const overlapEnd = evEnd < dayEnd ? evEnd : dayEnd;
+        const overlapMs = Math.max(0, overlapEnd - overlapStart);
+        const dayMs = 24*60*60*1000;
+
+        const isFullForThisDay = overlapMs >= dayMs - 1000;
+        const isPartialForThisDay = overlapMs > 0 && !isFullForThisDay;
+
+        // target the inner content element for styling
+        const inner = info.el.querySelector('.fc-event-main, .fc-event-title, .fc-event-title-container') || info.el;
+
+        // clear wrapper background so our inner style shows
+        info.el.style.background = 'transparent';
+        info.el.style.border = 'none';
+
+        // apply inline styles to inner element
+        if (isFullForThisDay) {
+          Object.assign(inner.style, {
+            background: '#d3d3d3',
+            border: 'none',
+            display: 'block',
+            height: '100%',
+            width: '100%',
+            boxSizing: 'border-box',
+            color: '#222'
+          });
+        } else if (isPartialForThisDay) {
+          Object.assign(inner.style, {
+            background: 'linear-gradient(135deg, #d3d3d3 50%, transparent 50%)',
+            border: 'none',
+            display: 'block',
+            height: '100%',
+            width: '100%',
+            boxSizing: 'border-box',
+            color: '#222'
+          });
+        } else {
+          inner.style.background = 'transparent';
+        }
+
+        // ensure event fills the cell area visually
+        info.el.style.position = 'relative';
+        info.el.style.padding = '0';
+        info.el.style.margin = '0';
+      } catch (e) {
+        console.warn('eventDidMount error', e);
+      }
+    }
+  });
+
+  calendar.render();
+
+  // Load ICS, parse, and add events
+  (async function loadIcsAndAddEvents(){
+    // Try direct fetch first (faster if CORS allowed)
+    const tryUrls = [ICS_URL].concat(PROXY_URLS);
+    let icsText = null;
+    try {
+      icsText = await fetchWithFallback(tryUrls);
+    } catch (e) {
+      console.error('All ICS fetch attempts failed:', e);
+      // show a small message in calendar area
+      const msg = document.createElement('div');
+      msg.style.textAlign = 'center';
+      msg.style.color = '#a00';
+      msg.style.marginTop = '8px';
+      msg.textContent = 'Could not load availability feed. If this persists, host the .ics on a CORS-enabled server.';
+      calendarEl.parentNode.insertBefore(msg, calendarEl.nextSibling);
+      return;
+    }
+
+    const events = parseIcsToEvents(icsText);
+    if (!events || events.length === 0) {
+      console.warn('No events parsed from ICS');
+      return;
+    }
+
+    // Convert to FullCalendar event source objects
+    const fcEvents = events.map(e => ({
+      title: e.title || 'Booked',
+      start: e.start,
+      end: e.end,
+      allDay: e.allDay || false,
+      display: 'block' // ensure visible
+    }));
+
+    calendar.addEventSource(fcEvents);
+  })();
+
+})();
+</script>
+</body>
+</html>
